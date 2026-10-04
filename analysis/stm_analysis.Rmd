@@ -1,0 +1,960 @@
+---
+title: "Arctic Framing in Indian Discourse: STM Analysis"
+author: "Akanksha Singh"
+date: "2026"
+output: github_document
+---
+
+This notebook reproduces the computational part of the MSc thesis *India and the changing meaning of the Arctic* (Leiden University, 2026): corpus construction from Nexis Uni exports, metadata extraction, text cleaning, structural topic models for three subcorpora, framing trajectories over time, and dictionary validation of the STM framing scores. See the repository README for context and `data/README.md` for data access.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Load Packages
+
+```{r packages}
+library(here)
+library(quanteda)
+library(readtext)
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(stm)
+library(stringr)
+library(tidyverse)
+library(scales)
+
+# Output folder for saved figures
+dir.create(here("figures"), showWarnings = FALSE)
+```
+
+---
+
+## 2. Load and Merge Data
+
+```{r load-data}
+# Load three separate document folders (see data/README.md for expected layout)
+gov_2013_2026  <- readtext(here("data", "raw", "gov_2013_2026", "*"),  encoding = "utf-8")
+full_2013_2026 <- readtext(here("data", "raw", "full_2013_2026", "*"), encoding = "utf-8")
+full_2008_2012 <- readtext(here("data", "raw", "full_2008_2012", "*"), encoding = "utf-8")
+
+# Remove duplicates from full corpus, keeping the government folder as authoritative
+full_2013_2026_clean <- full_2013_2026 %>%
+  filter(!doc_id %in% gov_2013_2026$doc_id)
+
+# Merge all three into one dataset and rename doc_id
+Arctic_IND_fr <- bind_rows(
+  gov_2013_2026,
+  full_2013_2026_clean,
+  full_2008_2012
+) %>%
+  rename(Title = doc_id)
+
+# Confirm merge
+cat("Total documents loaded:", nrow(Arctic_IND_fr), "\n")
+cat("Duplicate titles remaining:", sum(duplicated(Arctic_IND_fr$Title)), "\n")
+```
+
+---
+
+## 3. Extract Metadata
+
+```{r extract-dates}
+# Extract publication date and year from Load-Date field
+Arctic_IND_fr <- Arctic_IND_fr %>%
+  mutate(
+    load_date = str_extract(text, "(?i)load-date:\\s*([A-Za-z]+ \\d{1,2},\\s*\\d{4})") %>%
+      str_remove("(?i)load-date:\\s*") %>%
+      as.Date(format = "%B %d, %Y"),
+    year = as.integer(format(load_date, "%Y"))
+  )
+```
+
+```{r extract-source}
+# Extract source name using publication date line as anchor
+# and classify into Government or Public Discourse
+Arctic_IND_fr <- Arctic_IND_fr %>%
+  mutate(
+    source_name = sapply(text, function(x) {
+
+      # Isolate text above "Body" section only
+      body_idx <- regexpr("\\bBody\\b", x)
+      if (body_idx > 0) x <- substr(x, 1, body_idx - 1)
+
+      lines <- str_trim(str_split(x, "\n")[[1]])
+
+      # Pattern 1: full date "Month D, YYYY" with optional weekday and time
+      date_line_idx <- which(str_detect(lines,
+        "^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}"))
+
+      # Pattern 2: month and year only "Month YYYY" (fallback)
+      if (length(date_line_idx) == 0) {
+        date_line_idx <- which(str_detect(lines,
+          "^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}$"))
+      }
+
+      # Return line immediately above first date match
+      if (length(date_line_idx) > 0) {
+        idx <- date_line_idx[1]
+        for (i in (idx - 1):1) {
+          if (nchar(lines[i]) > 0) return(lines[i])
+        }
+      }
+
+      return(NA_character_)
+    }),
+
+    # Classify source type
+    source_type = case_when(
+      source_name %in% c(
+        "Indian Government News",
+        "IPR",
+        "Government of India Ministry of External Affairs - Press Releases",
+        "Government Initiated campaigns",
+        "Government of India Ministry of External Affairs - Speeches & Statements",
+        "Indian Parliament Q&A",
+        "Government of India Ministry of External Affairs - Media Briefings"
+      ) ~ "Government",
+      is.na(source_name) ~ NA_character_,
+      TRUE ~ "Public Discourse"
+    )
+  )
+
+# Verify extraction
+cat("Year distribution:\n")
+print(table(Arctic_IND_fr$year, useNA = "always"))
+
+cat("\nSource type distribution:\n")
+print(table(Arctic_IND_fr$source_type, useNA = "always"))
+```
+
+---
+
+## 4. Clean Text and Filter Corpus
+
+```{r body-extraction}
+# Extract body text only: content between "Body" and "Classification" markers
+# (?s) flag allows matching across line breaks
+Arctic_IND_fr <- Arctic_IND_fr %>%
+  mutate(
+    text_clean = str_extract(text, "(?s)(?<=\\bBody\\b).*?(?=\\bClassification\\b)") %>%
+      str_trim(),
+    doc_length = str_count(text_clean, "\\w+")
+  )
+
+cat("Documents with extracted body text:", sum(!is.na(Arctic_IND_fr$text_clean)), "\n")
+cat("Documents with empty body text:",
+    sum(nchar(trimws(Arctic_IND_fr$text_clean)) == 0, na.rm = TRUE), "\n")
+cat("\nBody text length summary:\n")
+print(summary(Arctic_IND_fr$doc_length))
+```
+
+```{r length-threshold}
+# Check document counts across different word count thresholds
+# to determine appropriate minimum length cutoff
+cat("Documents under 100 words:", sum(Arctic_IND_fr$doc_length < 100), "\n")
+cat("Documents under 150 words:", sum(Arctic_IND_fr$doc_length < 150), "\n")
+cat("Documents under 200 words:", sum(Arctic_IND_fr$doc_length < 200), "\n")
+
+# Inspect documents under 200 words before deciding threshold
+Arctic_IND_fr %>%
+  filter(doc_length < 200) %>%
+  select(Title, source_type, year, doc_length) %>%
+  arrange(doc_length) %>%
+  print(n = Inf)
+```
+
+```{r apply-filter}
+# Documents under 100 words are too short to carry reliable topic signal.
+# Documents between 100 and 200 words include substantively relevant short items
+# such as parliamentary questions, brief official statements and short news
+# briefs; removing these would unnecessarily reduce the government corpus.
+# Threshold set at 100 words based on inspection above.
+
+Arctic_IND_fr <- Arctic_IND_fr %>%
+  filter(doc_length >= 100)
+
+cat("Final corpus after length filter:", nrow(Arctic_IND_fr), "\n")
+cat("\nSource type distribution:\n")
+print(table(Arctic_IND_fr$source_type, useNA = "always"))
+```
+
+---
+
+## 5. Define Subcorpora
+
+```{r subcorpora}
+# Full corpus: 2008-2026 (government + public discourse)
+corpus_full <- Arctic_IND_fr
+
+# Public discourse only: 2013-2026
+corpus_pub <- Arctic_IND_fr %>%
+  filter(source_type == "Public Discourse", year >= 2013)
+
+# Government only: 2013-2026
+corpus_gov <- Arctic_IND_fr %>%
+  filter(source_type == "Government", year >= 2013)
+
+cat("Full corpus (2008-2026):", nrow(corpus_full), "documents\n")
+cat("Public Discourse (2013-2026):", nrow(corpus_pub), "documents\n")
+cat("Government (2013-2026):", nrow(corpus_gov), "documents\n")
+```
+
+---
+
+## 6. Preprocessing Function
+
+```{r preprocessing-function}
+# Custom stopwords
+custom_stops <- c(
+  # Corpus-specific constants
+  "india", "indian", "arctic",
+  # Neutral dateline cities
+  "new", "delhi", "london", "washington", "brussels", "geneva",
+  # Generic function words
+  "also", "one", "can", "will", "would", "like", "use", "used",
+  "using", "make", "made", "take", "said", "say", "says", "year",
+  "years", "first", "second", "third", "two", "three",
+  # Titles and abbreviations
+  "mr", "ms", "dr", "km", "per", "cent", "rs",
+  # Political titles (do not add framing signal)
+  "prime", "minist", "modi", "minister", "ministri", "countri",
+  "country", "nation", "state", "govern", "presid",
+  "president", "leader", "offici", "official",
+  "meet", "visit", "discuss", "held", "told", "spoke",
+  # Noise vocabulary from environmental activism cluster
+  "greenpeac", "shell", "protest", "activist", "spill",
+  "drill", "rig", "corpor", "quarter", "earn", "revenu",
+  "ebitda", "upsc", "papua", "guinea", "wildfir", "displac"
+)
+
+# Preprocessing function: takes a dataframe, returns DFM and STM-ready objects
+preprocess_corpus <- function(data, text_field = "text_clean") {
+
+  corp <- corpus(data, text_field = text_field)
+
+  # Unstemmed tokens, used for dictionary validation
+  toks_raw <- tokens(corp,
+                     remove_punct   = TRUE,
+                     remove_numbers = TRUE,
+                     remove_url     = TRUE,
+                     remove_symbols = TRUE) %>%
+    tokens_tolower() %>%
+    tokens_remove(pattern = stopwords("en")) %>%
+    tokens_remove(pattern = custom_stops) %>%
+    tokens_remove(pattern = phrase(c("new delhi", "united nations",
+                                     "press release", "end document")))
+
+  # Stemmed tokens, used for STM
+  toks_stemmed <- toks_raw %>% tokens_wordstem()
+
+  # DFM from stemmed tokens
+  dfm_out <- dfm(toks_stemmed) %>%
+    dfm_trim(min_termfreq = 3, min_docfreq = 2,
+             termfreq_type = "count", docfreq_type = "count")
+
+  # Convert to STM format
+  stm_out <- convert(dfm_out, to = "stm")
+
+  list(
+    corpus    = corp,
+    toks_raw  = toks_raw,
+    dfm       = dfm_out,
+    stm_input = stm_out
+  )
+}
+```
+
+---
+
+## 7. STM: Full Corpus (2008-2026)
+
+### 7.1 Preprocess and SearchK
+
+```{r full-searchk}
+prep_full <- preprocess_corpus(corpus_full)
+year_full <- corpus_full$year
+
+cat("Full corpus DFM dimensions:", dim(prep_full$dfm), "\n")
+
+# SearchK to identify optimal number of topics
+set.seed(123)
+searchk_full <- searchK(
+  documents  = prep_full$stm_input$documents,
+  vocab      = prep_full$stm_input$vocab,
+  K          = c(6, 8, 10, 12, 15),
+  prevalence = ~ year_full,
+  data       = prep_full$stm_input$meta,
+  init.type  = "Spectral",
+  verbose    = FALSE
+)
+
+plot(searchk_full)
+
+# SearchK results as readable table
+data.frame(
+  K        = unlist(searchk_full$results$K),
+  semcoh   = round(unlist(searchk_full$results$semcoh), 3),
+  heldout  = round(unlist(searchk_full$results$heldout), 3),
+  residual = round(unlist(searchk_full$results$residual), 3)
+)
+```
+
+### 7.2 Run STM Model
+
+```{r full-stm}
+# K = 8 selected: semantic coherence peaks at K = 6 and 8 and declines from K = 10;
+# K = 8 preserves theoretically meaningful distinctions
+set.seed(123)
+stm_full <- stm(
+  documents  = prep_full$stm_input$documents,
+  vocab      = prep_full$stm_input$vocab,
+  K          = 8,
+  prevalence = ~ year_full,
+  max.em.its = 100,
+  data       = prep_full$stm_input$meta,
+  init.type  = "Spectral"
+)
+
+# Examine top words per topic to inform framing assignment
+labelTopics(stm_full, n = 15)
+
+# Topic labels based on theoretical interpretation of top words
+# Strategic framing: T2, T4, T7
+# Climate-Science framing: T1, T3, T8
+# Excluded (mixed/noise): T5 (India-Nordic, straddles both framings),
+#                         T6 (Arctic governance mixed with environmental activism noise)
+
+labels_full <- c(
+  "T1: Indian Polar and Ocean Science",                            # Climate-Science
+  "T2: India-Russia Strategic Partnership",                        # Strategic
+  "T3: Climate Change and Environmental Impact",                   # Climate-Science
+  "T4: India-Russia Energy Investment",                            # Strategic
+  "T5: India-Nordic Cooperation [Excluded]",                       # Mixed, excluded
+  "T6: Arctic Governance and Great Power Competition [Excluded]",  # Mixed/noise, excluded
+  "T7: Maritime Logistics and Military Cooperation",               # Strategic
+  "T8: Arctic Sea Ice and Climate Science"                         # Climate-Science
+)
+
+# Visual summary of topic prevalence
+plot(stm_full, type = "summary",
+     custom.labels = labels_full,
+     xlim = c(0, 0.5),
+     main = "STM Topic Prevalence: Full Corpus (2008-2026)")
+```
+
+### 7.3 Framing Trajectory: Full Corpus
+
+```{r full-trajectory}
+# Extract theta matrix (document-topic proportions)
+theta_full <- as.data.frame(stm_full$theta)
+colnames(theta_full) <- paste0("T", 1:8)
+theta_full$year        <- corpus_full$year
+theta_full$source_type <- corpus_full$source_type
+
+# Raw framing scores
+# Strategic: T2 (India-Russia Strategic), T4 (Energy Investment), T7 (Maritime Logistics)
+# Climate-Science: T1 (Indian Polar Science), T3 (Climate Change), T8 (Arctic Sea Ice)
+# Excluded: T5 (India-Nordic, mixed), T6 (Arctic Governance, mixed/noise)
+theta_full <- theta_full %>%
+  mutate(
+    strategic_score = T2 + T4 + T7,
+    climate_score   = T1 + T3 + T8
+  )
+
+# Yearly mean framing scores
+yearly_full <- theta_full %>%
+  group_by(year) %>%
+  summarise(
+    n_docs         = n(),
+    strategic_mean = mean(strategic_score),
+    climate_mean   = mean(climate_score),
+    .groups        = "drop"
+  )
+
+# Reshape for plotting
+yearly_full_long <- yearly_full %>%
+  pivot_longer(cols = c(strategic_mean, climate_mean),
+               names_to  = "framing",
+               values_to = "proportion") %>%
+  mutate(framing = recode(framing,
+                          "strategic_mean" = "Strategic Framing",
+                          "climate_mean"   = "Climate-Science Framing"))
+
+p1 <- ggplot(yearly_full_long,
+       aes(x = year, y = proportion, color = framing, group = framing)) +
+
+  # Pre-observer contextual shading (2008-2012)
+  annotate("rect", xmin = 2007.5, xmax = 2012.5, ymin = 0, ymax = 0.85,
+           fill = "grey85", alpha = 0.5) +
+  annotate("text", x = 2010, y = 0.80,
+           label = "Pre-observer\ncontextual period",
+           size = 2.8, color = "grey50", hjust = 0.5) +
+
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.0) +
+  geom_smooth(method = "loess", se = FALSE,
+              linewidth = 0.5, linetype = "dashed", alpha = 0.7) +
+
+  # Document count labels
+  geom_text(data = yearly_full,
+            aes(x = year, y = -0.04, label = paste0("n=", n_docs)),
+            inherit.aes = FALSE,
+            size = 2.3, color = "grey50", angle = 45) +
+
+  scale_color_manual(values = c(
+    "Strategic Framing"       = "#2166ac",
+    "Climate-Science Framing" = "#1a9850")) +
+
+  scale_x_continuous(breaks = 2008:2026) +
+  scale_y_continuous(limits = c(-0.08, 0.85),
+                     labels = percent_format(accuracy = 1)) +
+
+  labs(
+    title    = "Strategic vs Climate-Science Framing of the Arctic in Indian Discourse",
+    subtitle = "Full corpus (2008-2026) | Raw mean topic proportion | STM K=8",
+    x        = "Year",
+    y        = "Mean Topic Proportion",
+    color    = "Framing Type",
+    caption  = paste0(
+      "N = ", nrow(corpus_full), " documents | ",
+      "Strategic: T2+T4+T7 | Climate-Science: T1+T3+T8 | ",
+      "T5 and T6 excluded (mixed/noise) | ",
+      "Dashed lines = loess smoother | ",
+      "Scores do not sum to 1; remaining proportion reflects excluded topics")
+  ) +
+
+  theme_minimal() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, color = "grey40"),
+    plot.caption     = element_text(size = 7, color = "grey50"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p1)
+ggsave(here("figures", "plot1_full_corpus_trajectory.png"),
+       plot = p1, width = 13, height = 7, dpi = 300)
+```
+
+---
+
+## 8. STM: Public Discourse (2013-2026)
+
+### 8.1 Preprocess and SearchK
+
+```{r pub-searchk}
+prep_pub <- preprocess_corpus(corpus_pub)
+year_pub <- corpus_pub$year
+
+cat("Public Discourse DFM dimensions:", dim(prep_pub$dfm), "\n")
+
+set.seed(123)
+searchk_pub <- searchK(
+  documents  = prep_pub$stm_input$documents,
+  vocab      = prep_pub$stm_input$vocab,
+  K          = c(6, 8, 10, 12, 15),
+  prevalence = ~ year_pub,
+  data       = prep_pub$stm_input$meta,
+  init.type  = "Spectral",
+  verbose    = FALSE
+)
+
+plot(searchk_pub)
+
+# SearchK results as readable table
+data.frame(
+  K        = unlist(searchk_pub$results$K),
+  semcoh   = round(unlist(searchk_pub$results$semcoh), 3),
+  heldout  = round(unlist(searchk_pub$results$heldout), 3),
+  residual = round(unlist(searchk_pub$results$residual), 3)
+)
+```
+
+### 8.2 Run STM Model
+
+```{r pub-stm}
+# K = 8 selected on the basis of the searchK diagnostics above
+set.seed(123)
+stm_pub <- stm(
+  documents  = prep_pub$stm_input$documents,
+  vocab      = prep_pub$stm_input$vocab,
+  K          = 8,
+  prevalence = ~ year_pub,
+  max.em.its = 100,
+  data       = prep_pub$stm_input$meta,
+  init.type  = "Spectral"
+)
+
+# Examine top words per topic to inform framing assignment
+labelTopics(stm_pub, n = 15)
+
+# Topic labels based on theoretical interpretation of top words
+# Strategic framing: T3, T4, T6, T8
+# Climate-Science framing: T1, T2, T7
+# Excluded (mixed/noise): T5 (India-Nordic merged with environmental activism)
+labels_pub <- c(
+  "T1: Indian Polar and Ocean Science",                        # Climate-Science
+  "T2: Climate Change and Environmental Impact",               # Climate-Science
+  "T3: India-Russia Strategic Partnership",                    # Strategic
+  "T4: India-Russia Energy Investment",                        # Strategic
+  "T5: India-Nordic and Environmental Activism [Excluded]",    # Excluded
+  "T6: Maritime Logistics and Military Cooperation",           # Strategic
+  "T7: Arctic Sea Ice and Climate Science",                    # Climate-Science
+  "T8: Arctic Geopolitics and Great Power Competition"         # Strategic
+)
+
+# Visual summary of topic prevalence
+plot(stm_pub, type = "summary",
+     custom.labels = labels_pub,
+     xlim = c(0, 0.5),
+     main = "STM Topic Prevalence: Public Discourse (2013-2026)")
+```
+
+### 8.3 Framing Trajectory: Public Discourse
+
+```{r pub-trajectory}
+# Extract theta matrix (document-topic proportions)
+theta_pub <- as.data.frame(stm_pub$theta)
+colnames(theta_pub) <- paste0("T", 1:8)
+theta_pub$year <- corpus_pub$year
+
+# Raw framing scores
+# Strategic: T3 (India-Russia Strategic), T4 (Energy Investment),
+#            T6 (Maritime Logistics), T8 (Arctic Geopolitics)
+# Climate-Science: T1 (Indian Polar Science), T2 (Climate Change), T7 (Arctic Sea Ice)
+# Excluded: T5 (India-Nordic/Environmental Activism, mixed/noise)
+theta_pub <- theta_pub %>%
+  mutate(
+    strategic_score = T3 + T4 + T6 + T8,
+    climate_score   = T1 + T2 + T7
+  )
+
+# Yearly mean framing scores
+yearly_pub <- theta_pub %>%
+  group_by(year) %>%
+  summarise(
+    n_docs         = n(),
+    strategic_mean = mean(strategic_score),
+    climate_mean   = mean(climate_score),
+    .groups        = "drop"
+  )
+
+# Reshape for plotting
+yearly_pub_long <- yearly_pub %>%
+  pivot_longer(cols = c(strategic_mean, climate_mean),
+               names_to  = "framing",
+               values_to = "proportion") %>%
+  mutate(framing = recode(framing,
+                          "strategic_mean" = "Strategic Framing",
+                          "climate_mean"   = "Climate-Science Framing"))
+
+p2 <- ggplot(yearly_pub_long,
+       aes(x = year, y = proportion, color = framing, group = framing)) +
+
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.0) +
+  geom_smooth(method = "loess", se = FALSE,
+              linewidth = 0.5, linetype = "dashed", alpha = 0.7) +
+
+  # Document count labels
+  geom_text(data = yearly_pub,
+            aes(x = year, y = -0.04, label = paste0("n=", n_docs)),
+            inherit.aes = FALSE,
+            size = 2.3, color = "grey50", angle = 45) +
+
+  scale_color_manual(values = c(
+    "Strategic Framing"       = "#2166ac",
+    "Climate-Science Framing" = "#1a9850")) +
+
+  scale_x_continuous(breaks = 2013:2026) +
+  scale_y_continuous(limits = c(-0.08, 0.85),
+                     labels = percent_format(accuracy = 1)) +
+
+  labs(
+    title    = "Strategic vs Climate-Science Framing: Public Discourse",
+    subtitle = "Public Discourse only (2013-2026) | Raw mean topic proportion | STM K=8",
+    x        = "Year",
+    y        = "Mean Topic Proportion",
+    color    = "Framing Type",
+    caption  = paste0(
+      "N = ", nrow(corpus_pub), " documents | ",
+      "Strategic: T3+T4+T6+T8 | Climate-Science: T1+T2+T7 | ",
+      "T5 excluded (mixed/noise) | ",
+      "Dashed lines = loess smoother | ",
+      "Scores do not sum to 1; remaining proportion reflects excluded topic")
+  ) +
+
+  theme_minimal() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, color = "grey40"),
+    plot.caption     = element_text(size = 7, color = "grey50"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p2)
+ggsave(here("figures", "plot2_public_discourse_trajectory.png"),
+       plot = p2, width = 13, height = 7, dpi = 300)
+```
+
+### 8.4 EstimateEffect: Public Discourse
+
+```{r pub-estimateeffect}
+# Estimate effect of year on topic prevalence
+# Tests whether topic proportions change significantly over time
+prep_effect_pub <- estimateEffect(
+  formula  = 1:8 ~ year_pub,
+  stmobj   = stm_pub,
+  metadata = data.frame(year_pub = year_pub)
+)
+
+# Strategic topics: expected to increase over time
+plot(prep_effect_pub,
+     covariate     = "year_pub",
+     topics        = c(3, 4, 6, 8),
+     method        = "continuous",
+     xlab          = "Year",
+     ylab          = "Expected Topic Proportion",
+     main          = "Strategic Topics: Prevalence Over Time (Public Discourse)",
+     labeltype     = "custom",
+     custom.labels = c(
+       "T3: India-Russia Strategic",
+       "T4: India-Russia Energy",
+       "T6: Maritime Logistics",
+       "T8: Arctic Geopolitics"
+     ))
+
+# Climate-science topics: expected to decrease or remain stable
+plot(prep_effect_pub,
+     covariate     = "year_pub",
+     topics        = c(1, 2, 7),
+     method        = "continuous",
+     xlab          = "Year",
+     ylab          = "Expected Topic Proportion",
+     main          = "Climate-Science Topics: Prevalence Over Time (Public Discourse)",
+     labeltype     = "custom",
+     custom.labels = c(
+       "T1: Indian Polar Science",
+       "T2: Climate Change",
+       "T7: Arctic Sea Ice Science"
+     ))
+```
+
+---
+
+## 9. STM: Government Documents (2013-2026)
+
+### 9.1 Preprocess and SearchK
+
+```{r gov-searchk}
+prep_gov <- preprocess_corpus(corpus_gov)
+year_gov <- corpus_gov$year
+
+cat("Government corpus DFM dimensions:", dim(prep_gov$dfm), "\n")
+cat("Note: Small corpus (n =", nrow(corpus_gov),
+    "), lower K range tested\n")
+
+set.seed(123)
+searchk_gov <- searchK(
+  documents  = prep_gov$stm_input$documents,
+  vocab      = prep_gov$stm_input$vocab,
+  K          = c(3, 4, 5, 6),
+  prevalence = ~ year_gov,
+  data       = prep_gov$stm_input$meta,
+  init.type  = "Spectral",
+  verbose    = FALSE
+)
+
+plot(searchk_gov)
+
+data.frame(
+  K        = unlist(searchk_gov$results$K),
+  semcoh   = round(unlist(searchk_gov$results$semcoh), 3),
+  heldout  = round(unlist(searchk_gov$results$heldout), 3),
+  residual = round(unlist(searchk_gov$results$residual), 3)
+)
+```
+
+### 9.2 Run STM Model
+
+```{r gov-stm}
+# K = 3 selected: semantic coherence peaks clearly at K = 3
+set.seed(123)
+stm_gov <- stm(
+  documents  = prep_gov$stm_input$documents,
+  vocab      = prep_gov$stm_input$vocab,
+  K          = 3,
+  prevalence = ~ year_gov,
+  max.em.its = 100,
+  data       = prep_gov$stm_input$meta,
+  init.type  = "Spectral"
+)
+
+# Examine top words per topic to inform framing assignment
+labelTopics(stm_gov, n = 15)
+
+# Topic labels based on theoretical interpretation of top words
+# Strategic framing: T3
+# Climate-Science framing: T1
+# Excluded (mixed): T2 (India-Nordic diplomatic cooperation; straddles
+#   sustainability and diplomatic registers, consistent with exclusion
+#   of the India-Nordic topic across all three STM runs)
+labels_gov <- c(
+  "T1: Indian Polar and Ocean Science [Climate-Science]",
+  "T2: India-Nordic Diplomatic Cooperation [Excluded: Mixed]",
+  "T3: India-Russia Strategic and Energy Engagement [Strategic]"
+)
+
+# Visual summary of topic prevalence
+plot(stm_gov, type = "summary",
+     custom.labels = labels_gov,
+     xlim = c(0, 0.6),
+     main = "STM Topic Prevalence: Government Documents (2013-2026)")
+```
+
+### 9.3 Framing Trajectory: Government Documents
+
+```{r gov-trajectory}
+# Extract theta matrix (document-topic proportions)
+theta_gov <- as.data.frame(stm_gov$theta)
+colnames(theta_gov) <- paste0("T", 1:3)
+theta_gov$year <- corpus_gov$year
+
+# Raw framing scores
+# Strategic: T3 (India-Russia Strategic and Energy Engagement)
+# Climate-Science: T1 (Indian Polar and Ocean Science)
+# Excluded: T2 (India-Nordic, mixed)
+theta_gov <- theta_gov %>%
+  mutate(
+    strategic_score = T3,
+    climate_score   = T1
+  )
+
+# Yearly mean framing scores
+yearly_gov <- theta_gov %>%
+  group_by(year) %>%
+  summarise(
+    n_docs         = n(),
+    strategic_mean = mean(strategic_score),
+    climate_mean   = mean(climate_score),
+    .groups        = "drop"
+  )
+
+# Yearly counts, important for interpreting reliability
+cat("Government documents per year:\n")
+print(yearly_gov %>% select(year, n_docs), n = Inf)
+
+# Reshape for plotting
+yearly_gov_long <- yearly_gov %>%
+  pivot_longer(cols = c(strategic_mean, climate_mean),
+               names_to  = "framing",
+               values_to = "proportion") %>%
+  mutate(framing = recode(framing,
+                          "strategic_mean" = "Strategic Framing",
+                          "climate_mean"   = "Climate-Science Framing"))
+
+p3 <- ggplot(yearly_gov_long,
+       aes(x = year, y = proportion, color = framing, group = framing)) +
+
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.0) +
+  geom_smooth(method = "loess", se = FALSE,
+              linewidth = 0.5, linetype = "dashed", alpha = 0.7) +
+
+  # Document count labels
+  geom_text(data = yearly_gov,
+            aes(x = year, y = -0.04, label = paste0("n=", n_docs)),
+            inherit.aes = FALSE,
+            size = 2.3, color = "grey50", angle = 45) +
+
+  scale_color_manual(values = c(
+    "Strategic Framing"       = "#2166ac",
+    "Climate-Science Framing" = "#1a9850")) +
+
+  scale_x_continuous(breaks = 2013:2026) +
+  scale_y_continuous(limits = c(-0.08, 1.05),
+                     labels = percent_format(accuracy = 1)) +
+
+  labs(
+    title    = "Strategic vs Climate-Science Framing: Government Documents",
+    subtitle = "Government only (2013-2026) | Raw mean topic proportion | STM K=3",
+    x        = "Year",
+    y        = "Mean Topic Proportion",
+    color    = "Framing Type",
+    caption  = paste0(
+      "N = ", nrow(corpus_gov), " documents | ",
+      "Strategic: T3 | Climate-Science: T1 | ",
+      "T2 excluded (mixed) | ",
+      "Dashed lines = loess smoother | ",
+      "Caution: small corpus, n per year shown above | ",
+      "Temporal estimates unreliable in years with n < 3 | ",
+      "This analysis motivates the qualitative coding approach adopted subsequently")
+  ) +
+
+  theme_minimal() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, color = "grey40"),
+    plot.caption     = element_text(size = 7, color = "grey50"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p3)
+ggsave(here("figures", "plot3_government_trajectory.png"),
+       plot = p3, width = 13, height = 7, dpi = 300)
+```
+
+### 9.4 EstimateEffect: Government Documents
+
+```{r gov-estimateeffect}
+# Wide confidence intervals are expected given the small corpus.
+# Results demonstrate the unreliability of STM temporal estimation
+# on sparse government data, motivating the qualitative coding approach.
+prep_effect_gov <- estimateEffect(
+  formula  = 1:3 ~ year_gov,
+  stmobj   = stm_gov,
+  metadata = data.frame(year_gov = year_gov)
+)
+
+# Plot all topics; confidence interval width is the key finding here
+plot(prep_effect_gov,
+     covariate     = "year_gov",
+     topics        = 1:3,
+     method        = "continuous",
+     xlab          = "Year",
+     ylab          = "Expected Topic Proportion",
+     main          = paste0(
+       "Government Documents: Topic Prevalence Over Time\n",
+       "Wide confidence intervals reflect sparse corpus (N = ",
+       nrow(corpus_gov), " documents)"),
+     labeltype     = "custom",
+     custom.labels = c(
+       "T1: Indian Polar Science [Climate-Science]",
+       "T2: India-Nordic Cooperation [Excluded]",
+       "T3: India-Russia Strategic [Strategic]"
+     ))
+```
+
+---
+
+## 10. Dictionary Validation
+
+```{r dictionary-validation}
+# Theory-driven dictionaries applied to UNSTEMMED public discourse tokens.
+# Purpose: validate STM topic interpretations by checking whether
+# documents with high STM strategic scores also score high on the
+# strategic dictionary, and vice versa for climate-science.
+
+# Strategic framing dictionary, drawn from the theoretical framework
+dict_strategic <- dictionary(list(
+  strategic = c(
+    "geopolit*", "strateg*", "secur*", "sovereig*", "militar*",
+    "power", "rival*", "competi*", "dominan*", "influenc*",
+    "interest*", "deterren*", "alliance*", "balance*",
+    "observer status", "resource*", "energ*", "hydrocarbon*",
+    "northern sea route", "relos", "indo-pacific",
+    "great power", "china", "russia", "nato",
+    "access", "postur*", "logist*", "naval*", "shipping*"
+  )
+))
+
+# Climate-science framing dictionary, drawn from the theoretical framework
+dict_climate <- dictionary(list(
+  climate_science = c(
+    "climat*", "glacier*", "melt*", "sea ice", "permafrost",
+    "warming", "emission*", "carbon*", "monsoon*", "himalay*",
+    "temperature*", "precipitation*", "scientific research",
+    "himadri", "environment*", "ecosystem*", "biodiversity",
+    "ncpor", "arctic science", "atmospheric*", "oceanograph*",
+    "polar research", "polar expedition"
+  )
+))
+
+# Apply dictionaries to unstemmed public discourse tokens
+dfm_strategic_val <- dfm_lookup(dfm(prep_pub$toks_raw),
+                                dictionary = dict_strategic)
+dfm_climate_val   <- dfm_lookup(dfm(prep_pub$toks_raw),
+                                dictionary = dict_climate)
+
+# Validation dataframe; dictionary scores normalised by document length
+validation <- data.frame(
+  year           = corpus_pub$year,
+  strategic_dict = as.numeric(dfm_strategic_val[, "strategic"]) /
+                   corpus_pub$doc_length,
+  climate_dict   = as.numeric(dfm_climate_val[, "climate_science"]) /
+                   corpus_pub$doc_length,
+  strategic_stm  = theta_pub$strategic_score,
+  climate_stm    = theta_pub$climate_score
+)
+
+# Correlation between dictionary scores and STM framing scores
+r_strategic <- round(cor(validation$strategic_dict, validation$strategic_stm), 3)
+r_climate   <- round(cor(validation$climate_dict,   validation$climate_stm),   3)
+
+cat("Validation correlations:\n")
+cat("Strategic, Dictionary vs STM:", r_strategic, "\n")
+cat("Climate-Science, Dictionary vs STM:", r_climate, "\n")
+
+# Scatter plot: strategic validation
+p_val_strategic <- ggplot(validation,
+       aes(x = strategic_dict, y = strategic_stm)) +
+  geom_point(alpha = 0.3, color = "#2166ac", size = 1.5) +
+  geom_smooth(method = "lm", color = "#2166ac",
+              se = TRUE, linewidth = 0.8) +
+  labs(
+    title    = "Dictionary Validation: Strategic Framing",
+    subtitle = paste0("r = ", r_strategic),
+    x        = "Strategic Dictionary Score (normalised by document length)",
+    y        = "STM Strategic Framing Score",
+    caption  = paste0("Public Discourse corpus (2013-2026) | N = ",
+                      nrow(corpus_pub), " documents")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = "#2166ac")
+  )
+
+print(p_val_strategic)
+ggsave(here("figures", "plot4_validation_strategic.png"),
+       plot = p_val_strategic, width = 9, height = 6, dpi = 300)
+
+# Scatter plot: climate-science validation
+p_val_climate <- ggplot(validation,
+       aes(x = climate_dict, y = climate_stm)) +
+  geom_point(alpha = 0.3, color = "#1a9850", size = 1.5) +
+  geom_smooth(method = "lm", color = "#1a9850",
+              se = TRUE, linewidth = 0.8) +
+  labs(
+    title    = "Dictionary Validation: Climate-Science Framing",
+    subtitle = paste0("r = ", r_climate),
+    x        = "Climate-Science Dictionary Score (normalised by document length)",
+    y        = "STM Climate-Science Framing Score",
+    caption  = paste0("Public Discourse corpus (2013-2026) | N = ",
+                      nrow(corpus_pub), " documents")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = "#1a9850")
+  )
+
+print(p_val_climate)
+ggsave(here("figures", "plot5_validation_climate.png"),
+       plot = p_val_climate, width = 9, height = 6, dpi = 300)
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

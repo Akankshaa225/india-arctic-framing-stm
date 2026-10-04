@@ -1,0 +1,13 @@
+# R and RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+
+# Raw data: licensed Nexis Uni content, must never be uploaded
+data/raw/
+
+# System files
+.DS_Store
+Thumbs.db
